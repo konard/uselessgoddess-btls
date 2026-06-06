@@ -9,6 +9,40 @@ and [Raw Public Key](https://docs.rs/btls/latest/btls/ssl/struct.SslRef.html#met
 
 To use BoringSSL from Rust, prefer the [higher-level safe API](https://docs.rs/btls).
 
+## Speeding up the build
+
+Compiling BoringSSL from source is by far the most expensive part of building
+this crate. The build script applies two accelerations automatically, both with
+a transparent fallback to the previous behaviour when the relevant tooling is
+unavailable:
+
+- **Ninja generator.** When [`ninja`](https://ninja-build.org/) is found on
+  `PATH`, it is used instead of the default `make` generator. Ninja has lower
+  configure overhead and schedules the compile better. Install it (e.g.
+  `apt install ninja-build`, `brew install ninja`) to opt in. An explicit
+  `CMAKE_GENERATOR` is always respected, and Windows generator selection is left
+  untouched.
+
+- **Compiler caching.** `RUSTC_WRAPPER` only caches `rustc`, so the ~370
+  BoringSSL translation units are recompiled on every clean build even when
+  [`sccache`](https://github.com/mozilla/sccache) or
+  [`ccache`](https://ccache.dev/) is configured. The build script now wires that
+  cache into CMake (`CMAKE_C{,XX}_COMPILER_LAUNCHER`) so the C/C++ objects are
+  cached too. If `RUSTC_WRAPPER`/`RUSTC_WORKSPACE_WRAPPER` points at `sccache` or
+  `ccache` it is reused as-is; otherwise set `BORING_BSSL_COMPILER_LAUNCHER`
+  explicitly:
+
+  ```sh
+  # Reuse an existing sccache setup for the C/C++ build automatically:
+  export RUSTC_WRAPPER=sccache
+
+  # ...or point the BoringSSL build at a cache explicitly:
+  export BORING_BSSL_COMPILER_LAUNCHER=sccache
+  ```
+
+  With a warm cache this turns the dominant compile step into cache hits,
+  roughly halving clean-build time.
+
 ## Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally

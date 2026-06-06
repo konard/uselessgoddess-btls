@@ -542,6 +542,101 @@ fn run_command(command: &mut Command) -> io::Result<Output> {
     Ok(out)
 }
 
+/// Applies backwards-compatible build accelerations to the BoringSSL CMake
+/// build. Both are opt-in by environment/tooling and fall back to the previous
+/// behaviour when unavailable, so existing setups keep working unchanged:
+///
+///   * **Ninja generator** — when `ninja` is on `PATH`, use it instead of the
+///     default (Make on Unix). Ninja has lower configure overhead and schedules
+///     the build better. Skipped when the caller pinned a generator via
+///     `CMAKE_GENERATOR`, or for Windows targets (where cmake-rs' generator
+///     selection and the `msvc_lib_subdir` layout are assumed).
+///   * **Compiler cache** — when a cache such as `sccache`/`ccache` is
+///     configured, wrap the C/C++ compiler with it so BoringSSL object files
+///     are cached across builds. `RUSTC_WRAPPER` only caches `rustc`, leaving
+///     this compile — by far the largest part of `btls-sys` — uncached.
+fn configure_build_acceleration(config: &Config, cfg: &mut cmake::Config) {
+    if let Some(generator) = preferred_cmake_generator(config) {
+        println!("cargo:warning=building BoringSSL with the {generator} generator");
+        cfg.generator(generator);
+    }
+
+    if let Some(launcher) = compiler_launcher() {
+        println!(
+            "cargo:warning=caching the BoringSSL C/C++ build with compiler launcher `{}`",
+            launcher.to_string_lossy()
+        );
+        cfg.define("CMAKE_C_COMPILER_LAUNCHER", &launcher);
+        cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", &launcher);
+    }
+}
+
+/// Returns the CMake generator to use, or `None` to keep CMake's default.
+fn preferred_cmake_generator(config: &Config) -> Option<&'static str> {
+    println!("cargo:rerun-if-env-changed=CMAKE_GENERATOR");
+
+    // Respect an explicitly requested generator (e.g. the `MinGW Makefiles`
+    // used by the i686 mingw CI target).
+    if std::env::var_os("CMAKE_GENERATOR").is_some() {
+        return None;
+    }
+
+    // Windows generator handling (MSVC multi-config layout consumed by
+    // `msvc_lib_subdir`, MSYS vs MinGW makefiles) is intentionally left to
+    // cmake-rs' defaults.
+    if config.target_os == "windows" {
+        return None;
+    }
+
+    is_program_available("ninja").then_some("Ninja")
+}
+
+/// Returns a compiler launcher (e.g. `sccache` or `ccache`) to wrap the
+/// BoringSSL C/C++ compiler invocations with, enabling cross-build caching of
+/// the most expensive part of `btls-sys`.
+///
+/// Resolution order:
+///   1. `BORING_BSSL_COMPILER_LAUNCHER` — explicit opt-in/override.
+///   2. `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` — transparently reused, but
+///      only when it is a recognised compiler cache (`sccache`/`ccache`), so an
+///      unrelated rustc wrapper is never mistaken for a C compiler launcher.
+fn compiler_launcher() -> Option<OsString> {
+    println!("cargo:rerun-if-env-changed=BORING_BSSL_COMPILER_LAUNCHER");
+    if let Some(launcher) =
+        std::env::var_os("BORING_BSSL_COMPILER_LAUNCHER").filter(|v| !v.is_empty())
+    {
+        return Some(launcher);
+    }
+
+    for var in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"] {
+        println!("cargo:rerun-if-env-changed={var}");
+        let Some(wrapper) = std::env::var_os(var).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let is_compiler_cache = Path::new(&wrapper)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.eq_ignore_ascii_case("sccache") || stem.eq_ignore_ascii_case("ccache")
+            });
+        if is_compiler_cache {
+            return Some(wrapper);
+        }
+    }
+    None
+}
+
+/// Returns whether `program` can be executed (used to probe for `ninja`).
+fn is_program_available(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn build_boringssl_or_get_prebuilt(config: &Config) -> &Path {
     static BUILD_SOURCE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -575,7 +670,18 @@ fn build_boringssl_or_get_prebuilt(config: &Config) -> &Path {
             cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
         }
 
+        // Accelerate the (dominant) BoringSSL C/C++ compile: prefer the Ninja
+        // generator and route the compiler through a cache like `sccache` when
+        // one is configured.
+        configure_build_acceleration(config, &mut cfg);
+
+        // Build both `ssl` and `crypto`. The first `.build()` runs the CMake
+        // configure step (applying the defines set above); disabling
+        // `always_configure` afterwards skips the otherwise-redundant second
+        // configure before the `crypto` target is built, while still ensuring
+        // both archives are produced.
         cfg.build_target("ssl").build();
+        cfg.always_configure(false);
         let path = cfg.build_target("crypto").build();
         let build_dir = path.join("build");
         if build_dir.exists() {
