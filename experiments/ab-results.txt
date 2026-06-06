@@ -1,0 +1,20 @@
+## NEW: ninja, cold (no C/C++ cache)
+ninja-cold-1: 23.781s
+ninja-cold-2: 22.983s
+## NEW: ninja + sccache, warm (the issue scenario: RUSTC_WRAPPER=sccache)
+ninja-sccache-warmup: 27.841s
+ninja-sccache-warm-1: 12.107s
+ninja-sccache-warm-2: 10.664s
+--- sccache stats over the two warm runs ---
+Compile requests                     566
+Compile requests executed            562
+Cache hits                           562
+Cache hits (C/C++)                   560
+Cache hits (Rust)                      2
+Cache misses                           0
+Cache hits rate                   100.00 %
+Cache hits rate (C/C++)           100.00 %
+Cache hits rate (Rust)            100.00 %
+## BASELINE (original code: Unix Makefiles, no C/C++ cache)
+baseline-make-1: 28.903s
+baseline-make-2: 29.065s
